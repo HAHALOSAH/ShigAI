@@ -18,7 +18,7 @@ const initialPrompt = [
         "role": "user",
         "parts": [
             {
-                "text": "You are about to help a user in a support channel on a product called \"Vencord\". Vencord is a Discord client mod that allows users to customize the Discord client with plugins and themes. You will be given the FAQ and plugin list."
+                "text": "Your name is ShigAI. You are about to help a user in a support channel on a product called \"Vencord\". Vencord is a Discord client mod that allows users to customize the Discord client with plugins and themes. You will be given the FAQ and plugin list."
             },
             {
                 "text": "FAQ:"
@@ -42,16 +42,20 @@ const initialPrompt = [
     }
 ];
 
-const apiKey = process.env.GEMINI_API_KEY;
+const apiKeys = process.env.GEMINI_API_KEYS.split(",");
 const discordToken = process.env.DISCORD_TOKEN;
 const channelId = process.env.CHANNEL_ID;
 
-const genAI = new GoogleGenerativeAI(apiKey);
-const fileManager = new GoogleAIFileManager(apiKey);
+const keyForChannel = new Map();
 
-const model = genAI.getGenerativeModel({
+var current = 0;
+
+const genAIs = apiKeys.map(apiKey => new GoogleGenerativeAI(apiKey));
+const fileManagers = apiKeys.map(apiKey => new GoogleAIFileManager(apiKey));
+
+const models = genAIs.map(genAI => genAI.getGenerativeModel({
     model: "gemini-1.5-flash",
-});
+}));
 
 const generationConfig = {
     temperature: 1,
@@ -78,6 +82,8 @@ client.on('messageCreate', async message => {
     if (!message.mentions.has(client.user)) return;
     if (!chatSessions.has(message.channelId)) {
         if (message.channel.parentId !== channelId) return;
+        keyForChannel.set(message.channelId, current++ % apiKeys.length)
+        const model = models[keyForChannel.get(message.channelId)];
         chatSessions.set(message.channelId, model.startChat({
             generationConfig,
             history: JSON.parse(JSON.stringify(initialPrompt))
@@ -92,12 +98,19 @@ async function aiResponse(message, content = message.content) {
     if (busyChannels.has(message.channelId)) return;
     busyChannels.add(message.channelId);
 
-    console.log(`${message.author.name}: ${content}`);
+    var interval, timeout = setTimeout(() => {
+        interval = setInterval(() => {
+            message.channel.sendTyping();
+        }, 10000);
+        message.channel.sendTyping();
+    }, 500);
+
+    console.log(`${message.author.username}: ${content}`);
 
     try {
         const { file, mimeType } = await handleAttachments(message);
 
-        replaceMentionsAndChannels(content);
+        content = replaceMentionsAndChannels(content);
 
         const result = await chatSessions.get(message.channelId).sendMessage([
             `${message.author.username}: ${content}`,
@@ -108,6 +121,9 @@ async function aiResponse(message, content = message.content) {
     } catch (error) {
         handleErrorResponse(error, message);
     }
+
+    clearTimeout(timeout);
+    clearInterval(interval);
 }
 
 async function handleAttachments(message) {
@@ -121,7 +137,7 @@ async function handleAttachments(message) {
         const name = attachment.name.replace(/\//g, '\\\/');
         const path = `./tmp/${name}`;
         fs.writeFileSync(path, buffer);
-        file = await uploadToGemini(path, attachment.contentType);
+        file = await uploadToGemini(path, attachment.contentType, fileManagers[keyForChannel.get(message.channelId)]);
         mimeType = attachment.contentType;
     }
 
@@ -131,7 +147,7 @@ async function handleAttachments(message) {
 function replaceMentionsAndChannels(content) {
     content.replace(/<@([0-9]+)>/g, (match, id) => {
         if (client.users.cache.get(id)) {
-            content = content.replace(match, `<@${client.users.cache.get(id).username}>`);
+            content = content.replace(match, `<@${id}> (${client.users.cache.get(id).username}) `);
         }
     });
     content.replace(/<#([0-9]+)>/g, (match, id) => {
@@ -139,9 +155,10 @@ function replaceMentionsAndChannels(content) {
             content = content.replace(match, `<#${client.channels.cache.get(id).name}>`);
         }
     });
+    return content;
 }
 
-async function uploadToGemini(path, mimeType) {
+async function uploadToGemini(path, mimeType, fileManager) {
     const uploadResult = await fileManager.uploadFile(path, {
         mimeType,
         displayName: path.split("/").pop(),
@@ -205,12 +222,15 @@ client.on('threadCreate', async thread => {
                 color: 0xdd7878
             }]
         });
+        keyForChannel.set(thread.id, current++ % apiKeys.length);
+        const model = models[keyForChannel.get(thread.id)];
         chatSessions.set(thread.id, model.startChat({
             generationConfig,
             history: JSON.parse(JSON.stringify(initialPrompt))
         }));
         const messages = await thread.messages.fetch();
-        const firstMessage = messages.first();
+        const firstMessage = messages.last();
+        console.log(firstMessage)
         if (firstMessage) {
             await aiResponse(firstMessage, `${thread.name}\n${firstMessage.content}`);
         }
